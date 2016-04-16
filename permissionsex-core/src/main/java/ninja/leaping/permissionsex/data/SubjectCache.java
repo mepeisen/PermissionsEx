@@ -16,13 +16,11 @@
  */
 package ninja.leaping.permissionsex.data;
 
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
+import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.collect.Maps;
 import ninja.leaping.permissionsex.PermissionsEx;
 import ninja.leaping.permissionsex.backend.DataStore;
-import ninja.leaping.permissionsex.util.Util;
 
 import javax.annotation.Nullable;
 import java.util.Map;
@@ -36,7 +34,7 @@ import java.util.function.Function;
 public class SubjectCache {
     private final String type;
     private final DataStore dataStore;
-    private final LoadingCache<String, ImmutableSubjectData> cache;
+    private final AsyncLoadingCache<String, ImmutableSubjectData> cache;
     private final Map<String, Caching<ImmutableSubjectData>> cacheHolders = new ConcurrentHashMap<>();
     private final CacheListenerHolder<String, ImmutableSubjectData> listeners;
     private final Map.Entry<String, String> defaultIdentifier;
@@ -53,57 +51,54 @@ public class SubjectCache {
         this.type = type;
         this.dataStore = dataStore;
         this.defaultIdentifier = Maps.immutableEntry(PermissionsEx.SUBJECTS_DEFAULTS, type);
-        cache = CacheBuilder.newBuilder()
+
+        cache = Caffeine.newBuilder()
                 .maximumSize(512)
-                .build(CacheLoader.from(identifier -> dataStore.getData(type, identifier, clearListener(identifier))));
+                .buildAsync(((key, executor) -> dataStore.getData(type, key, clearListener(key))));
         if (existing != null) {
             this.listeners = existing.listeners;
-            existing.cache.asMap().forEach((k, v) -> {
-                try {
-                    listeners.call(k, getData(k, null));
-                } catch (ExecutionException e) {
-                    // TODO: Not ignore this somehow? Add a listener in to the backend?
-                }
+            existing.cache.synchronous().asMap().forEach((k, v) -> {
+                getData(k, null).thenAccept(data -> listeners.call(k, data)); // TODO: Combine completion results?
             });
         } else {
             this.listeners = new CacheListenerHolder<>();
         }
     }
 
-    public ImmutableSubjectData getData(String identifier, Caching<ImmutableSubjectData> listener) throws ExecutionException {
+    public CompletableFuture<ImmutableSubjectData> getData(String identifier, Caching<ImmutableSubjectData> listener) {
         Objects.requireNonNull(identifier, "identifier");
 
-        ImmutableSubjectData ret = cache.get(identifier);
-        if (listener != null) {
-            listeners.addListener(identifier, listener);
-        }
+        CompletableFuture<ImmutableSubjectData> ret = cache.get(identifier);
+        ret.thenRun(() -> {
+            if (listener != null) {
+                listeners.addListener(identifier, listener);
+            }
+        });
         return ret;
     }
 
-    public SubjectDataReference getReference(String identifier) throws ExecutionException {
+    public CompletableFuture<SubjectDataReference> getReference(String identifier) {
         return getReference(identifier, true);
     }
 
-    public SubjectDataReference getReference(String identifier, boolean strongListeners) throws ExecutionException {
+    public CompletableFuture<SubjectDataReference> getReference(String identifier, boolean strongListeners) {
         final SubjectDataReference ref = new SubjectDataReference(identifier, this, strongListeners);
-        ref.data.set(getData(identifier, ref));
-        return ref;
+        return getData(identifier, ref).thenApply(data -> {
+            ref.data.set(data);
+            return ref;
+        });
     }
 
     public CompletableFuture<ImmutableSubjectData> update(String identifier, Function<ImmutableSubjectData, ImmutableSubjectData> action) {
-        ImmutableSubjectData data;
-        try {
-            data = getData(identifier, null);
-        } catch (ExecutionException e) {
-            return Util.failedFuture(e);
-        }
-
-        ImmutableSubjectData newData = action.apply(data);
-        if (newData != data) {
-            return set(identifier, newData);
-        } else {
-            return CompletableFuture.completedFuture(data);
-        }
+        return getData(identifier, null)
+                .thenCompose(data -> {
+                    ImmutableSubjectData newData = action.apply(data);
+                    if (data != newData) {
+                        return set(identifier, newData);
+                    } else {
+                        return CompletableFuture.completedFuture(data);
+                    }
+                });
     }
 
     public void load(String identifier) throws ExecutionException {
@@ -115,22 +110,18 @@ public class SubjectCache {
     public void invalidate(String identifier) {
         Objects.requireNonNull(identifier, "identifier");
 
-        cache.invalidate(identifier);
+        cache.synchronous().invalidate(identifier);
         cacheHolders.remove(identifier);
         listeners.removeAll(identifier);
     }
 
     public void cacheAll() {
         for (String ident : dataStore.getAllIdentifiers(type)) {
-            try {
-                cache.get(ident);
-            } catch (ExecutionException e) {
-                // oh noes, but we'll still squash it
-            }
+            cache.synchronous().refresh(ident);
         }
     }
 
-    public boolean isRegistered(String identifier) {
+    public CompletableFuture<Boolean> isRegistered(String identifier) {
         Objects.requireNonNull(identifier, "identifier");
 
         return dataStore.isRegistered(type, identifier);
@@ -148,7 +139,7 @@ public class SubjectCache {
 
     private Caching<ImmutableSubjectData> clearListener(final String name) {
         Caching<ImmutableSubjectData> ret = newData -> {
-            cache.put(name, newData);
+            cache.put(name, CompletableFuture.completedFuture(newData));
             listeners.call(name, newData);
         };
         cacheHolders.put(name, ret);
