@@ -71,12 +71,13 @@ public class FilePermissionsExConfiguration implements PermissionsExConfiguratio
         node.mergeValuesFrom(fallbackConfig);
         ConfigurationNode defBackendNode = node.getNode("default-backend");
         if (defBackendNode.isVirtual() || defBackendNode.getValue() == null) { // Set based on whether or not the H2 backend is available
-            try {
+            defBackendNode.setValue("default-file");
+            /*try {
                 Class.forName("org.h2.Driver");
                 defBackendNode.setValue("default");
             } catch (ClassNotFoundException e) {
                 defBackendNode.setValue("default-file");
-            }
+            }*/
         }
 
         FilePermissionsExConfiguration config = new FilePermissionsExConfiguration(loader, node);
@@ -87,6 +88,16 @@ public class FilePermissionsExConfiguration implements PermissionsExConfiguratio
     private void load() throws IOException {
         try {
             ObjectMapper.forObject(this).populate(this.node);
+        } catch (ObjectMappingException e) {
+            throw new IOException(e);
+        }
+        this.loader.save(node);
+    }
+
+    @Override
+    public void save() throws IOException {
+        try {
+            ObjectMapper.forObject(this).serialize(this.node);
         } catch (ObjectMappingException e) {
             throw new IOException(e);
         }

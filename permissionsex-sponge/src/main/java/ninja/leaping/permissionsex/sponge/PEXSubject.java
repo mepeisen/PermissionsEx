@@ -17,43 +17,67 @@
 package ninja.leaping.permissionsex.sponge;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import ninja.leaping.permissionsex.subject.CalculatedSubject;
 import ninja.leaping.permissionsex.exception.PermissionsLoadingException;
+import org.spongepowered.api.Sponge;
 import org.spongepowered.api.command.CommandSource;
 import org.spongepowered.api.service.permission.Subject;
 import org.spongepowered.api.service.context.Context;
 import org.spongepowered.api.service.context.ContextCalculator;
-import org.spongepowered.api.service.permission.option.OptionSubject;
 import org.spongepowered.api.util.Tristate;
 import org.spongepowered.api.util.annotation.NonnullByDefault;
 
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
 
-import static ninja.leaping.permissionsex.sponge.PEXOptionSubjectData.parSet;
+import static ninja.leaping.permissionsex.sponge.PEXSubjectData.parSet;
 
 /**
  * Permissions subject implementation
  */
 @NonnullByDefault
-class PEXSubject implements OptionSubject {
+class PEXSubject implements Subject {
     private final PEXSubjectCollection collection;
-    private final PEXOptionSubjectData data;
-    private final PEXOptionSubjectData transientData;
+    private final PEXSubjectData data;
+    private final PEXSubjectData transientData;
     private volatile CalculatedSubject baked;
     private final String identifier;
+    private final AtomicReference<ActiveContextsHolder> cachedContexts = new AtomicReference<>();
+
+    private static class ActiveContextsHolder {
+        private final int updateTicks;
+        private final Set<Context> contexts;
+
+        private ActiveContextsHolder(int updateTicks, Set<Context> contexts) {
+            this.updateTicks = updateTicks;
+            this.contexts = contexts;
+        }
+
+        public int getUpdateTicks() {
+            return updateTicks;
+        }
+
+        public Set<Context> getContexts() {
+            return contexts;
+        }
+    }
 
     public PEXSubject(String identifier, PEXSubjectCollection collection) throws ExecutionException, PermissionsLoadingException {
         this.identifier = identifier;
         this.collection = collection;
         this.baked = collection.getCalculatedSubject(identifier);
-        this.data = new PEXOptionSubjectData(baked.data(), identifier, collection.getPlugin());
-        this.transientData = new PEXOptionSubjectData(baked.transientData(), identifier, collection.getPlugin());
+        this.data = new PEXSubjectData(baked.data(), collection.getPlugin());
+        this.transientData = new PEXSubjectData(baked.transientData(), collection.getPlugin());
+    }
+
+    private Timings time() {
+        return collection.getPlugin().getTimings();
     }
 
     @Override
@@ -81,25 +105,25 @@ class PEXSubject implements OptionSubject {
     }
 
     @Override
-    public PEXOptionSubjectData getSubjectData() {
+    public PEXSubjectData getSubjectData() {
         return data;
     }
 
     @Override
-    public PEXOptionSubjectData getTransientSubjectData() {
+    public PEXSubjectData getTransientSubjectData() {
         return transientData;
     }
 
     @Override
     public Optional<String> getOption(Set<Context> contexts, String key) {
-        Preconditions.checkNotNull(contexts, "contexts");
-        Preconditions.checkNotNull(key, "key");
-        return baked.getOption(parSet(contexts), key);
-    }
-
-    @Override
-    public Optional<String> getOption(String key) {
-        return getOption(getActiveContexts(), key);
+        time().onGetOption().startTimingIfSync();
+        try {
+            Preconditions.checkNotNull(contexts, "contexts");
+            Preconditions.checkNotNull(key, "key");
+            return baked.getOption(parSet(contexts), key);
+        } finally {
+            time().onGetOption().stopTimingIfSync();
+        }
     }
 
     @Override
@@ -108,22 +132,16 @@ class PEXSubject implements OptionSubject {
     }
 
     @Override
-    public boolean hasPermission(String permission) {
-        return hasPermission(getActiveContexts(), permission);
-    }
-
-    @Override
     public Tristate getPermissionValue(Set<Context> contexts, String permission) {
-        Preconditions.checkNotNull(contexts, "contexts");
-        Preconditions.checkNotNull(permission, "permission");
-        int ret = baked.getPermission(parSet(contexts), permission);
-        return ret == 0 ? Tristate.UNDEFINED : ret > 0 ? Tristate.TRUE : Tristate.FALSE;
-    }
-
-
-    @Override
-    public boolean isChildOf(Subject parent) {
-        return isChildOf(getActiveContexts(), parent);
+        time().onGetPermission().startTimingIfSync();
+        try {
+            Preconditions.checkNotNull(contexts, "contexts");
+            Preconditions.checkNotNull(permission, "permission");
+            int ret = baked.getPermission(parSet(contexts), permission);
+            return ret == 0 ? Tristate.UNDEFINED : ret > 0 ? Tristate.TRUE : Tristate.FALSE;
+        } finally {
+            time().onGetPermission().stopTimingIfSync();
+        }
     }
 
     @Override
@@ -135,22 +153,37 @@ class PEXSubject implements OptionSubject {
 
     @Override
     public Set<Context> getActiveContexts() {
-        Set<Context> set = new HashSet<>();
-        for (ContextCalculator<Subject> calc : this.collection.getPlugin().getContextCalculators()) {
-            calc.accumulateContexts(this, set);
+        time().onGetActiveContexts().startTimingIfSync();
+        try {
+            int ticks;
+            ActiveContextsHolder holder, newHolder;
+            do {
+                ticks = Sponge.getGame().getServer().getRunningTimeTicks();
+                holder = this.cachedContexts.get();
+                if (holder != null && ticks == holder.getUpdateTicks()) {
+                    return holder.getContexts();
+                }
+                Set<Context> set = new HashSet<>();
+                for (ContextCalculator<Subject> calc : this.collection.getPlugin().getContextCalculators()) {
+                    calc.accumulateContexts(this, set);
+                }
+                newHolder = new ActiveContextsHolder(ticks, ImmutableSet.copyOf(set));
+            } while (!this.cachedContexts.compareAndSet(holder, newHolder));
+            return newHolder.getContexts();
+        } finally {
+            time().onGetActiveContexts().stopTimingIfSync();
         }
-        return Collections.unmodifiableSet(set);
-    }
-
-    @Override
-    public List<Subject> getParents() {
-        return getParents(getActiveContexts());
     }
 
     @Override
     public List<Subject> getParents(final Set<Context> contexts) {
-        Preconditions.checkNotNull(contexts, "contexts");
-        return Lists.transform(baked.getParents(parSet(contexts)), input -> collection.getPlugin().getSubjects(input.getKey()).get(input.getValue()));
+        time().onGetParents().startTimingIfSync();
+        try {
+            Preconditions.checkNotNull(contexts, "contexts");
+            return Lists.transform(baked.getParents(parSet(contexts)), input -> collection.getPlugin().getSubjects(input.getKey()).get(input.getValue()));
+        } finally {
+            time().onGetParents().stopTimingIfSync();
+        }
     }
 
     @Override
